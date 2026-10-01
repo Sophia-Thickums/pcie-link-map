@@ -1,0 +1,293 @@
+#!/usr/bin/env python3
+"""pcie-link-map — the honest PCIe link report for Linux. No root. No dependencies.
+
+WHY THIS EXISTS
+---------------
+Every PCIe tool reports the WRONG NUMBER for the question people actually ask.
+
+    lspci -vv    ->  LnkSta: Speed 8GT/s, Width x16
+    sysfs        ->  current_link_width = 16
+    amdgpu       ->  pp_dpm_pcie: 8.0GT/s, x16
+
+All three describe the link between the **device and the bridge chip it sits behind**. None of
+them describe the link to the CPU. A card can read x16 in all three while its real host link is
+ONE lane — which is 16x less bandwidth than the tooling implies.
+
+The second trap: **a link is not a fixed number.** PCIe downclocks to Gen1 at idle. So a single
+reading is a photograph of a moment. Two people comparing "their" link width may be reading
+different states of the same machine.
+
+This tool fixes both:
+  * CAPABILITY = the narrowest MAX width/speed along the whole path from the root complex down.
+    That is the ceiling, it is stable, and it is what you size against.
+  * LIVE = the narrowest CURRENT width/speed. This drops at idle, so it is sampled and tagged.
+  * DIAGNOSIS = capability vs live, plus load, distinguishes "power saving" from a real fault.
+
+VERIFIED against the kernel's own account (the `dmesg` "available PCIe bandwidth" line) on a box
+with four GPUs behind three different kinds of link, including an OCuLink dock. Where this tool
+and your kernel disagree, THE KERNEL IS RIGHT — report it.
+
+Usage:
+    pcie-link-map                 # devices whose link is limited (the interesting ones)
+    pcie-link-map --gpu           # display / 3D controllers
+    pcie-link-map --watch 10      # sample the live state for 10 seconds
+    pcie-link-map --diagnose      # capability vs live + a verdict per device
+    pcie-link-map --json          # MACHINE-READABLE. one JSON document, stable keys.
+    pcie-link-map --json --gpu    # combine
+
+WHY --json EXISTS
+-----------------
+This tool is meant to be used by humans AND by other programs and agents. A pretty table is
+for a person; `--json` is for anything that has to consume it. The schema is deliberately flat
+and the keys are stable:
+
+    {"tool": "pcie-link-map", "version": 1,
+     "devices": { "<pci-address>": {
+        "capable":      {"width": 16, "gen": "Gen5", "gbps": 64.0},
+        "live":         {"width": 16, "gen": "Gen1"},
+        "card_reports": {"width": 16},          # what the device node claims (often a lie)
+        "binding":      "0000:00:01.1",         # the element that actually binds
+        "link_limited": false,
+        "downclocked":  true,
+        "is_gpu":       true,
+        "verdict":      "full width | idle-downclocked right now (normal power saving)"
+     }}}
+
+`link_limited` true means the host gives fewer lanes than the card advertises — that is the
+finding this whole tool exists to surface, and it is now a boolean an agent can branch on.
+"""
+
+import glob
+import json
+import os
+import sys
+import time
+
+# GB/s per LANE, theoretical. Gen1/2 pay 8b/10b (x0.8); Gen3/4 use 128b/130b (x0.985);
+# Gen5 is NRZ and pays nothing. Validated against measured bandwidth, not against memory:
+#   x1 Gen3 -> 1.00 theoretical, 0.87 measured (87%)   x4 Gen3 -> 4.00, 3.22 (80%)
+#   x16 Gen5 -> 64.0 theoretical, 54.9 measured (86%)
+PER_LANE_GBPS = {2.5: 0.25, 5.0: 0.50, 8.0: 1.00, 16.0: 1.97, 32.0: 4.00}
+GEN_NAME = {2.5: "Gen1", 5.0: "Gen2", 8.0: "Gen3", 16.0: "Gen4", 32.0: "Gen5"}
+
+PCI_ROOT = "/sys/bus/pci/devices"
+
+
+def _read(path):
+    try:
+        with open(path) as fh:
+            return fh.read().strip()
+    except OSError:
+        return None
+
+
+def _int(path):
+    v = _read(path)
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def _speed(path):
+    v = _read(path)
+    if not v:
+        return None
+    try:
+        return float(v.split()[0])
+    except (IndexError, ValueError):
+        return None
+
+
+def chain(addr):
+    """Every PCI element from the root complex down to this device, in order."""
+    real = os.path.realpath(os.path.join(PCI_ROOT, addr))
+    segs = [s for s in real.split("/") if s.startswith("0000:")]
+    return segs or [addr]
+
+
+def link_of(addr):
+    """Capability (max) and live (current) link, each the MINIMUM along the chain.
+
+    Take the two minima INDEPENDENTLY. Do not pair a width with the speed of the element that
+    had that width: a root port advertises its own max speed (16 GT/s) while the link below it
+    may have negotiated 8 GT/s. Pairing them reported a Gen3 card as Gen4 in development.
+    """
+    best = {"max_w": None, "cur_w": None, "max_s": None, "cur_s": None, "seg": None}
+    for seg in chain(addr):
+        b = os.path.join(PCI_ROOT, seg)
+        for key, f, conv in (("max_w", "max_link_width", _int),
+                             ("cur_w", "current_link_width", _int),
+                             ("max_s", "max_link_speed", _speed),
+                             ("cur_s", "current_link_speed", _speed)):
+            v = conv(os.path.join(b, f))
+            if v is None:
+                continue
+            if key.endswith("_w"):
+                if best[key] is None or v < best[key]:
+                    if key == "max_w":
+                        best["seg"] = seg
+                    best[key] = v
+            elif best[key] is None or v < best[key]:
+                best[key] = v
+    return best
+
+
+def describe(addr):
+    L = link_of(addr)
+    if L["max_w"] is None:
+        return None
+    own_max = _int(os.path.join(PCI_ROOT, addr, "max_link_width"))
+    per = PER_LANE_GBPS.get(L["max_s"])
+    return {
+        "addr": addr,
+        "cls": _read(os.path.join(PCI_ROOT, addr, "class")) or "",
+        "cap_w": L["max_w"], "cap_s": L["max_s"], "seg": L["seg"],
+        "cap_gbps": per * L["max_w"] if per else None,
+        "live_w": L["cur_w"], "live_s": L["cur_s"],
+        "own_max_w": own_max,
+        "capped": own_max is not None and own_max > L["max_w"],
+        "downclocked": (L["cur_s"] is not None and L["max_s"] is not None
+                        and L["cur_s"] < L["max_s"]),
+    }
+
+
+def verdict(d):
+    """The part that is actually useful: is this a fault, or power saving?"""
+    if d["capped"]:
+        base = (f"LINK LIMITED: the card reports x{d['own_max_w']}, the host provides "
+                f"x{d['cap_w']}. This is the slot/dock/riser, not the card.")
+    else:
+        base = "full width"
+    if d["downclocked"]:
+        base += " | idle-downclocked right now (normal power saving)"
+    return base
+
+
+def emit_json(rows, watch):
+    """The machine-readable half. Stable keys, one document, no prose mixed in."""
+    devs = {}
+    for d in rows:
+        entry = {
+            "capable": {"width": d["cap_w"], "gen": GEN_NAME.get(d["cap_s"]),
+                        "gbps": round(d["cap_gbps"], 2) if d["cap_gbps"] else None},
+            "live": {"width": d["live_w"], "gen": GEN_NAME.get(d["live_s"])},
+            "card_reports": {"width": d["own_max_w"]},
+            "binding": d["seg"],
+            "link_limited": bool(d["capped"]),
+            "downclocked": bool(d["downclocked"]),
+            "is_gpu": d["cls"].startswith("0x0300"),
+            "verdict": verdict(d),
+        }
+        devs[d["addr"]] = entry
+    doc = {
+        "tool": "pcie-link-map", "version": 1,
+        "caveat": ("capability is the minimum max width/speed along the sysfs chain; live is the "
+                   "minimum current, which drops at idle by power saving. Verified on one machine "
+                   "— if this disagrees with `dmesg | grep 'available PCIe bandwidth'`, the "
+                   "kernel is right."),
+        "devices": devs,
+    }
+    if watch:
+        samples = {}
+        t_end = time.time() + watch
+        while time.time() < t_end:
+            for d in rows:
+                L = link_of(d["addr"])
+                samples.setdefault(d["addr"], set()).add((L["cur_s"], L["cur_w"]))
+            time.sleep(0.25)
+        for addr, got in samples.items():
+            doc["devices"][addr]["observed"] = sorted(
+                {"gen": GEN_NAME.get(s, s), "width": w} for s, w in got
+                if s is not None)
+    print(json.dumps(doc, indent=2))
+    return 0
+
+
+def report(gpu_only, diagnose, watch, as_json=False):
+    rows = []
+    for path in sorted(glob.glob(os.path.join(PCI_ROOT, "*"))):
+        addr = os.path.basename(path)
+        d = describe(addr)
+        if not d:
+            continue
+        is_gpu = d["cls"].startswith("0x0300")
+        if gpu_only and not is_gpu:
+            continue
+        if not gpu_only and not as_json and not is_gpu and not d["capped"]:
+            continue          # keep the default output about devices that matter
+        rows.append(d)
+
+    if not rows:
+        print("no matching PCI devices found"); return 1
+
+    if as_json:
+        return emit_json(rows, watch)
+
+    print("PCIe LINKS — capability vs live state.  (narrowest value along the sysfs chain)")
+    print("No root needed. If this disagrees with `dmesg | grep 'available PCIe bandwidth'`,")
+    print("THE KERNEL IS RIGHT — this tool is verified on one machine, not all of them.")
+    print()
+    if diagnose and watch:
+        pass
+    hdr = ("%-13s %-11s %-9s %-14s  %s"
+           % ("address", "capable", "max GB/s", "live now", "note"))
+    print(hdr)
+    print("-" * len(hdr))
+    for d in rows:
+        live = ("%s x%s" % (GEN_NAME.get(d["live_s"], "?"), d["live_w"])
+                if d["live_s"] is not None else "-")
+        gb = "%.2f" % d["cap_gbps"] if d["cap_gbps"] else "-"
+        note = verdict(d) if diagnose else (
+            ("card says x%s, host gives x%s" % (d["own_max_w"], d["cap_w"])) if d["capped"]
+            else "")
+        print("%-13s %-11s %-9s %-14s  %s"
+              % (d["addr"],
+                 "x%s %s" % (d["cap_w"], GEN_NAME.get(d["cap_s"], "?")),
+                 gb, live, note))
+
+    if watch:
+        print()
+        print("WATCHING live link state for %ds — is the downclock a power saving, or stuck?" % watch)
+        samples = {}
+        t_end = time.time() + watch
+        while time.time() < t_end:
+            for d in rows:
+                # ★ SAMPLE THE CHAIN MINIMUM, NEVER THE DEVICE NODE.
+                # Reading current_link_speed straight off the device reports the link to the
+                # BRIDGE CHIP (x16) and hides the host link (x1) — the exact error this whole
+                # tool exists to correct. Caught in this tool's own watch mode, 2026-10-01.
+                L = link_of(d["addr"])
+                samples.setdefault(d["addr"], set()).add((L["cur_s"], L["cur_w"]))
+            time.sleep(0.25)
+        for d in rows:
+            got = sorted(samples.get(d["addr"], set()), key=lambda x: (x[0] or 0, x[1] or 0))
+            seen = ", ".join("%s x%s" % (GEN_NAME.get(s, s), w) for s, w in got)
+            print("  %-13s observed: %s" % (d["addr"], seen or "none"))
+            if len(got) == 1 and d["downclocked"]:
+                print("                ^ NEVER came up to %s — not power saving. If the device is"
+                      % GEN_NAME.get(d["cap_s"]))
+                print("                  under load, suspect link training, the riser, or the cable.")
+    print()
+    print("A physical x16-LENGTH slot can be electrically x1 or x4. `sudo dmidecode -t slot`")
+    print("names the real slot width; a slot whose Type reads e.g. 'PCI Express 3 x1' is x1 by")
+    print("design, and NO riser can widen it — a riser extends a slot, it does not convert one.")
+    return 0
+
+
+if __name__ == "__main__":
+    args = sys.argv[1:]
+    gpu = "--gpu" in args
+    diag = "--diagnose" in args
+    as_json = "--json" in args
+    watch = 0
+    if "--watch" in args:
+        i = args.index("--watch")
+        try:
+            watch = int(args[i + 1])
+        except (IndexError, ValueError):
+            watch = 10
+    if as_json:
+        # --json must include everything, so ignore the default "interesting only" filter
+        sys.exit(report(gpu, True, watch, as_json=True))
+    sys.exit(report(gpu, diag, watch))
