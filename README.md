@@ -129,6 +129,41 @@ sudo dmidecode -t slot
 
 A slot whose `Type` reads `PCI Express 3 x1` is **x1 by design**, even if its name is `PCIEX16(G4)_3`. That is the slot working as specified, not a seating fault or a BIOS setting.
 
+## ⚠️ KNOWN LIMITATION — read this before trusting a "stuck at x1"
+
+Found during a prior-art check after first publication (2026-10-01). **This tool can over-report
+a problem in one specific case, and you need to know which case.**
+
+The rule "take the minimum along the chain" is correct when a link is genuinely **narrow** — that
+is a wiring fact and every element agrees. It is **wrong** when a link is merely **downclocked** at
+idle lower down the chain.
+
+There is a documented case of exactly this: an Intel Arc B580 whose GPU endpoint *and* both
+on-card bridges all reported `2.5GT/s x1` while the machine was idle, on a link that is really
+**Gen4 x4**. Every element above the real link was reporting its idle state, and taking the minimum
+reads that as "x1" — a false alarm.
+
+**How to tell the two apart:**
+
+- **A narrow link** shows the low width with a *stable* generation, and it does **not** change under
+  load. That is a wiring fact. Trust it.
+- **A downclocked link** shows a low *generation* (Gen1, 2.5GT/s) that rises when the device works.
+  Use `--watch` **while the device is under load**. If the generation climbs, there was never a
+  width problem.
+
+```bash
+# start a game or a benchmark FIRST, then:
+./pcie-link-map --watch 20
+```
+
+**Known gap, stated plainly:** `--watch` currently reports generation changes but does not yet
+separate a *width* change from a *speed* change. Where a device's idle state differs in width as
+well as speed, this tool's live column can still be misleading. Comparing `capable` against `live`
+is the reliable read; the automation of that comparison is the next thing to fix.
+
+**If you hit this, please open an issue with your `dmesg` line** — that line is the ground truth
+this tool is checked against, and it has been verified on exactly one machine so far.
+
 ## Verified against
 
 This tool's output was checked against the kernel's own account — the boot-time
