@@ -96,9 +96,16 @@ ever comes up or is stuck low.
 ## Install
 
 ```bash
-curl -O https://raw.githubusercontent.com/<owner>/pcie-link-map/main/pcie-link-map
+curl -Lo pcie-link-map \
+  https://raw.githubusercontent.com/Sophia-Thickums/pcie-link-map/main/pcie-link-map
 chmod +x pcie-link-map
 ./pcie-link-map --gpu
+```
+
+No build step, no dependencies — it is one Python 3 file. Or just clone it:
+
+```bash
+git clone https://github.com/Sophia-Thickums/pcie-link-map
 ```
 
 Nothing to build, nothing to install, no root, no packages. Python 3 standard library only.
